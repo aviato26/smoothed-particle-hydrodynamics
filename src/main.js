@@ -1,6 +1,9 @@
 
+// this implementation was from https://lucasschuermann.com/writing/implementing-sph-in-2d
+
 import * as THREE from 'three';
 import css from './css/style.css';
+import Particle from './Particle.js';
 
 export default class Main
 {
@@ -13,236 +16,231 @@ export default class Main
     this.renderer.setSize( window.innerWidth, window.innerHeight );
     document.body.appendChild( this.renderer.domElement );
 
-    this.geometry;
-    this.material = new THREE.MeshBasicMaterial( { color: 0x00ff00 } );
-    //this.cube = new THREE.Mesh( this.geometry, this.material );
-    this.mesh;
+    this.boxSize = 60;
+    this.geometry = new THREE.BoxGeometry(this.boxSize, this.boxSize, this.boxSize);
+    this.material = new THREE.MeshBasicMaterial( {
+      color: 0xffffff,
+      side: THREE.DoubleSide,
+      wireframe: true
+    } );
 
-    // variables for sph
+    this.container = new THREE.Mesh(this.geometry, this.material);
+    this.scene.add(this.container)
+
     this.numOfParticles = 100;
-    this.velocitys = [];
-    this.forces = [];
-    this.position = [];
-    this.viscosity = [];
-    this.count = 0;
+    this.particles = [];
 
-    // kernel radius
-    this.h = 1.4;
-    // this is the kernel radius squared for optimization
-    this.hsq = this.h * this.h;
-    this.mass = 0.1;
-    this.visc = 1;
-    this.poly6 = 4 / (Math.PI * (this.h ** 8 ));
-    this.spiky_grad = -10 / (Math.PI * (this.h ** 5));
-    this.visc_lap = 40 / (Math.PI * (this.h ** 5));
+    // creating particle for user interation against other particles
+    this.usersMouse = new Particle();
+    this.particles.push(this.usersMouse);
+    //console.log(this.usersMouse)
+    //this.scene.add(this.usersMouse.mesh);
 
-    // const for equation of state
-    this.gasConst = 2000;
+    document.addEventListener('mousedown', () => {
+      this.boxSize -= 1;
+    })
 
-    // rest density
-    this.restDens = 35;
+    
+    // first method parameters
+    this.radius = 2;
+    this.mass = 2.5;
+    this.gravityConstant = -10
+    this.restDensity = 300;
+    this.viscosity = 200;
+    this.drag = 1;
 
-    this.dt = 0.0007;
-    //this.gravity = 0.9;
-    this.gravity = new THREE.Vector4(0, -9.81, 0, 1);
+    this.smoothingRadius = 12;
+    this.smoothingRadiusSquared = this.smoothingRadius * this.smoothingRadius;
+    this.gravity = new THREE.Vector3(0, -10, 0);
+    this.gravityMultiplicator = 2000;
+    this.gas = 2000;
+    this.deltaTime = 0.0007;
+    this.damping = -0.5;
+    
+    this.poly6 = 4 / (Math.PI * Math.pow(this.smoothingRadius, 8));
+    this.spiky_grad = -10 / (Math.PI * Math.pow(this.smoothingRadius, 5));
+    this.visc_lap = 40 / (Math.PI * Math.pow(this.smoothingRadius, 5));
+
+
+    let particle;
 
     //create particles
     for(let i = 0; i <= this.numOfParticles; i++){
-
-      this.velocitys.push(new THREE.Vector3(0));
-      this.forces.push(new THREE.Vector3(0));
-
-      //this.viscositys.push(new THREE.Vector3(0));      
-
-      this.geometry = new THREE.SphereGeometry();
-      this.mesh = new THREE.Mesh(this.geometry, this.material);
-      this.mesh.position.x = (i / 2) * Math.random() * 2;
-      this.mesh.position.y = (i / 2) * Math.random() * 2;      
+      particle = new Particle(this.radius);
       
-      this.position.push(this.mesh.position);
+      particle.position.x = Math.cos(i) * Math.PI;
+      particle.position.y = Math.sin(i) * Math.PI;      
+      particle.position.z = Math.cos(i) + Math.sin(i * 0.9) * Math.PI;            
 
-      this.position[i].rho = 0;
-      this.position[i].p = 0;
+      this.particles.push(particle);
 
-      this.scene.add(this.mesh);
+      this.scene.add(particle.mesh);
+
     }
 
-    this.camera.position.z = 100;
+    this.camera.position.z = this.boxSize + 50;
 
     this.animate = this.animate.bind(this);
-    this.computeDensityPressure();
-    this.computeForces();
-    this.integrate();
-    this.update(this.scene.children)
+
     this.animate();
   }
 
-  computeDensityPressure(){
-    let i;
-    let j;
-    let neighborParticle = new THREE.Vector3(0);
-    let r;
-    
-    for(i = 0; i < this.position.length; i++){
-      for(j = 0; j < this.position.length; j++){
-        // looping through all the particles to get there distances from one another
-        neighborParticle.subVectors(this.position[j], this.position[i]);
+computeDensityPressure(){
+  let i;
+  let j;
+  let px;
+  let py;
+  let pz;
+  let norm = new THREE.Vector3();
 
-        //r = new THREE.Vector3().dot(neighborParticle);
-        //r = new THREE.Vector3().subVectors(this.position[j], this.position[i]).dot(neighborParticle)
+  let r2;
+  let r2Sqrd;
 
-        r = (neighborParticle.x * neighborParticle.x) + (neighborParticle.y * neighborParticle.y) + (neighborParticle.z * neighborParticle.z);
+  for(i = 0; i < this.particles.length; i++){
+    // setting density to zero
+    // must reset particle density to zero to get correct current density calculation
+    this.particles[i].density = 0;
 
-        if(r < this.hsq){
-          //this.position[i].rho += this.mass * this.poly6 * (this.hsq - neighborParticle.x ** 3);
-          this.position[i].rho += this.mass * (315 / (64 * Math.PI * (this.h ** 9) * ((this.hsq - r)**3)))
-        }
+    for(j = 0; j < this.particles.length; j++){
+
+      px = this.particles[j].position.x - this.particles[i].position.x;
+      py = this.particles[j].position.y - this.particles[i].position.y;
+      pz = this.particles[j].position.z - this.particles[i].position.z;
+      
+      r2 = (px * px) + (py * py) + (pz * pz);
+      r2Sqrd = Math.sqrt(r2);
+
+      if(r2 < this.smoothingRadiusSquared){
+        this.particles[i].density += this.mass * this.poly6 * Math.pow((this.smoothingRadiusSquared) - r2, 3);
       }
-      //console.log(this.position[i].rho)
-      this.position[i].p = this.gasConst * (this.position[i].rho - this.restDens);
-      //console.log(this.position[i])
     }
-    //console.log(this.count)
-
+    this.particles[i].pressure = this.gas * (this.particles[i].density - this.restDensity);
   }
 
-  computeForces(){
-    let i;
-    let j;
-    let vel = new THREE.Vector3();
-    let rp2;
-    let r;
-    let rpn = new THREE.Vector3();
-    let neighborParticle = new THREE.Vector3(0);
+}
 
-    let fpress;
-    let fvisc;
-    let fgrav;
-    let gravDamp = 2000;
+computeForces(){
+  let i;
+  let j;
 
-    for(i = 0; i < this.position.length; i++){
+  let px;
+  let py;
+  let pz;
 
-      fpress = new THREE.Vector3(0);
-      fvisc = new THREE.Vector3(0);
-      fgrav = new THREE.Vector3(0, -9.81, 0);
+  let r2;
+  let r;
 
+  let norm = new THREE.Vector3();
 
-      for(j = 0; j < this.position.length; j++){
-        neighborParticle.subVectors(this.position[j], this.position[i]);
-        //r = rd.dot(neighborParticle);
-        //r = new THREE.Vector3().subVectors(this.position[j], this.position[i]).dot(neighborParticle)
-        rp2 = (neighborParticle.x * neighborParticle.x) + (neighborParticle.y * neighborParticle.y) + (neighborParticle.z * neighborParticle.z);
+  let fpress;
+  let fvisc;
+  let fgrav = new THREE.Vector3();
 
-        if(rp2 < this.hsq){
-          r = neighborParticle.length();
-          rpn = neighborParticle.normalize();
+  for(i = 0; i < this.particles.length; i++){
 
-          // compute pressure force contribution
-          //fpress.addScalar(-r * this.mass * (this.position[i].p + this.position[j].p) / (2 * this.position[j].rho) * this.spiky_grad * ((this.h - r) ** 3) );
-          //fpress.add(rpn.negate().multiplyScalar(this.mass * (this.position[j].p + this.position[i].p) / (2 * this.position[j].rho) * (-45 / (Math.PI * (this.h ** 6))) * ((this.h - r) ** 2) )); //* this.mass * (this.position[i].p + this.position[j].p) / (2 * this.position[j].rho) * this.spiky_grad * ((this.h - r) ** 3) );          
-          fpress.x += -rpn.negate().x * this.mass * (this.position[i].p + this.position[j].p) / (2 * this.position[j].rho) * this.spiky_grad * Math.pow(this.h - r , 3);
-          //fpress = rpn.negate().multiplyScalar(this.mass * (this.position[j].p + this.position[i].p) / (2 * this.position[j].rho) * (-45 / (Math.PI * (this.h ** 6))) * ((this.h - r) ** 2) ); //* this.mass * (this.position[i].p + this.position[j].p) / (2 * this.position[j].rho) * this.spiky_grad * ((this.h - r) ** 3) );                    
-          fvisc.add(vel.subVectors(this.velocitys[j], this.velocitys[i]).multiplyScalar(this.visc * this.mass).divideScalar(this.position[j].rho).multiplyScalar(45 / (Math.PI * (this.h ** 6) * (this.h - r))));
-        }
+    fpress = new THREE.Vector3();
+    fvisc = new THREE.Vector3();
 
-        //fgrav.y = this.gravity * this.position[i].rho// * 0.9;                            
+    for(j = 0; j < this.particles.length; j++){
+      norm.subVectors(this.particles[j].position, this.particles[i].position).normalize();
+      px = this.particles[j].position.x - this.particles[i].position.x;
+      py = this.particles[j].position.y - this.particles[i].position.y;
+      pz = this.particles[j].position.z - this.particles[i].position.z;
+      
+      r2 = ((px * px) + (py * py) + (pz * pz));
+      r = Math.sqrt(r2);
 
-        //fgrav.y -= 0.1;
-        //this.forces[i].add(fpress);
-        //this.forces[i].add(fpress);                
-        //this.forces[i].add(fpress).add(fvisc)//.add(fgrav);
-        //this.forces[i] = fpress.add(fvisc);
-        //console.log(fpress.add(fvisc))
-        //this.forces[i].add(fgrav);
+      if(r < this.smoothingRadius){
+        fpress.x += -norm.x * this.mass * (this.particles[i].pressure + this.particles[j].pressure) / (2 * this.particles[j].density) * this.spiky_grad * Math.pow(this.smoothingRadius - r, 3);
+        fpress.y += -norm.y * this.mass * (this.particles[i].pressure + this.particles[j].pressure) / (2 * this.particles[j].density) * this.spiky_grad * Math.pow(this.smoothingRadius - r, 3);        
+        fpress.z += -norm.z * this.mass * (this.particles[i].pressure + this.particles[j].pressure) / (2 * this.particles[j].density) * this.spiky_grad * Math.pow(this.smoothingRadius - r, 3);        
+
+        fvisc.x += this.viscosity * this.mass * (this.particles[j].velocity.x - this.particles[i].velocity.x) / this.particles[j].density * this.visc_lap * (this.smoothingRadius - r);
+        fvisc.y += this.viscosity * this.mass * (this.particles[j].velocity.y - this.particles[i].velocity.y) / this.particles[j].density * this.visc_lap * (this.smoothingRadius - r);
+        fvisc.z += this.viscosity * this.mass * (this.particles[j].velocity.z - this.particles[i].velocity.z) / this.particles[j].density * this.visc_lap * (this.smoothingRadius - r);                
       }
-      //this.forces[i] = fpress.add(fvisc).add(fgrav).multiplyScalar(this.position[i].rho).multiplyScalar(gravDamp);
-      //this.forces[i] = fpress.add(fvisc).add(fgrav).multiplyScalar(this.position[i].rho).multiplyScalar(gravDamp);      
 
-        if(this.position[i].y < -40){
-          //fgrav.negate();
-          fgrav.y = .1;
-          //this.gravDamp;
-          //this.forces[i] = fpress.add(fvisc).add(fgrav).multiplyScalar(this.position[i].rho).multiplyScalar(gravDamp);                
-         }
-         else{           
-          //this.forces[i] = fpress.add(fvisc).add(fgrav).multiplyScalar(this.position[i].rho).multiplyScalar(gravDamp);      
-         }
-         this.forces[i] = fpress.add(fvisc).add(fgrav).multiplyScalar(this.position[i].rho)//.multiplyScalar(gravDamp);      
-         //console.log(this.position[i].rho, this.position[i].p)         
     }
 
+    fgrav.y += this.gravityConstant * this.mass;
+
+    this.particles[i].combinedForce.x = fpress.x + fvisc.x;
+    this.particles[i].combinedForce.y = fpress.y + fvisc.y + fgrav.y;
+    this.particles[i].combinedForce.z = fpress.z + fvisc.z;
+
   }
 
-  integrate(){
-    let i;
+}
 
-    for(i = 0; i < this.position.length; i++){
-      this.velocitys[i].add(this.forces[i].multiplyScalar(this.dt).divideScalar(this.position[i].rho));
-      this.position[i].add(this.velocitys[i].multiplyScalar(this.dt));
-      //console.log(this.position[i])
+integrate(){
+  let i;
+  const damp = 0.5;
+  const constrain = this.boxSize / 2.1;
+  const restingLength = Math.abs(constrain);
+
+  for(i = 0; i < this.particles.length; i++){
+
+    if(this.particles[i].position.y < -constrain){
+      this.particles[i].velocity.y = -this.particles[i].velocity.y;
+      this.particles[i].velocity.y *= damp;
+
+    this.particles[i].position.y = -restingLength;
     }
+    else if(this.particles[i].position.y > constrain){
+      this.particles[i].velocity.y = -this.particles[i].velocity.y;
+      this.particles[i].velocity.y *= damp;
+      
+      this.particles[i].position.y = restingLength;
+    }
+    else if(this.particles[i].position.x < -constrain){
+      this.particles[i].velocity.x = -this.particles[i].velocity.x;
+      this.particles[i].velocity.x *= damp;
 
+      this.particles[i].position.x = -restingLength;
+    }
+    else if(this.particles[i].position.x > constrain){
+      this.particles[i].velocity.x = -this.particles[i].velocity.x;
+      this.particles[i].velocity.x *= damp;
+
+      this.particles[i].position.x = restingLength;
+    }
+    else if(this.particles[i].position.z < -constrain){
+      this.particles[i].velocity.z = -this.particles[i].velocity.z;
+      this.particles[i].velocity.z *= damp;      
+      
+      this.particles[i].position.z = -restingLength;
+    }
+    else if(this.particles[i].position.z > constrain){
+      this.particles[i].velocity.z = -this.particles[i].velocity.z;
+      this.particles[i].velocity.z *= damp;
+
+      this.particles[i].position.z = restingLength;
+    }
+    else {
+      
+
+      this.particles[i].velocity.x += this.deltaTime * this.particles[i].combinedForce.x / this.particles[i].density;
+      this.particles[i].velocity.y += this.deltaTime * this.particles[i].combinedForce.y / this.particles[i].density;
+      this.particles[i].velocity.z += this.deltaTime * this.particles[i].combinedForce.z / this.particles[i].density;        
+  
+      this.particles[i].position.x += this.deltaTime * this.particles[i].velocity.x;
+      this.particles[i].position.y += this.deltaTime * this.particles[i].velocity.y;
+      this.particles[i].position.z += this.deltaTime * this.particles[i].velocity.z;        
+
+
+   }
+   
   }
-
-  update(particles){
-    this.computeDensityPressure();
-    this.computeForces();
-    this.integrate();
-
-    particles.map((particle, index) => {
-/*
-       if(particle.position.y < -30){
-         //fgrav.negate();
-         this.forces[index].negate();
-          //this.gravity = -this.gravity;
-          //this.velocitys[index].y -= (this.dt * this.gravity);
-          //this.velocitys[index].negate();
-          //particle.position.y = -particle.position.y;          
-          //this.position[index].y = -this.position[index].y;                        
-          //this.gravity = this.gravity;          
-        }
-        else{
-          //this.velocitys[index].y = -this.velocitys[index].y;                            
-          //this.gravity = -this.gravity
-        }
-        //console.log(this.position[index].rho)
-        //fgrav.y = -this.gravity * this.position[index].rho * 0.9;                            
-        this.forces[index].add(fgrav).multiplyScalar(this.position[index].rho).multiplyScalar(this.gravDamp);
-*/
-        particle.position.x = this.position[index].x;
-        particle.position.y = this.position[index].y;
-        //console.log(particle.position)
-      })
-
-    //console.log(particles[0].position.x, particles[0].position.y)
-  }
+}
 
 
   animate(){
     requestAnimationFrame( this.animate );
 
-    this.dt += 0.0007;
-    //this.velocitys[0].y -= 0.001;
+    this.computeDensityPressure();
+    this.computeForces();
+    this.integrate();
 
-    this.update(this.scene.children)
-
-    //this.forces[this.count].y -= 0.01
-    //console.log(this.scene.children[0].position)
-
-/*
-    this.scene.children.map((particle, index) => {
-      if(particle.position.y > -10){
-        this.velocitys[index].y -= (this.dt * this.gravity);                        
-      }
-      else{
-        this.velocitys[index].y = -this.velocitys[index].y;                            
-      }
-      this.velocitys[index].multiplyScalar(0.981);
-
-      particle.position.y += this.velocitys[index].y;
-
-    })
-*/
     this.renderer.render( this.scene, this.camera );
   };
 
